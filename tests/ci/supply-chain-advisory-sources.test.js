@@ -126,10 +126,10 @@ async function run() {
   })) passed++; else failed++;
 
   if (await test('CLI JSON can be written as a scheduled workflow artifact', async () => {
-    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ecc-advisory-sources-'));
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ecc advisory sources-'));
     const outputPath = path.join(tempDir, 'advisory-sources.json');
     try {
-      const result = spawnSync('node', [
+      const result = spawnSync(process.execPath, [
         SCRIPT_PATH,
         '--json',
         '--generated-at',
@@ -138,7 +138,6 @@ async function run() {
         outputPath,
       ], {
         encoding: 'utf8',
-        shell: process.platform === 'win32',
       });
 
       assert.strictEqual(result.status, 0, result.stderr);
@@ -187,28 +186,25 @@ async function run() {
   })) passed++; else failed++;
 
   if (await test('CLI text output and invalid flag errors are stable', async () => {
-    const help = spawnSync('node', [SCRIPT_PATH, '--help'], {
+    const help = spawnSync(process.execPath, [SCRIPT_PATH, '--help'], {
       encoding: 'utf8',
-      shell: process.platform === 'win32',
     });
     assert.strictEqual(help.status, 0);
     assert.match(help.stdout, /--strict-refresh/);
 
-    const text = spawnSync('node', [
+    const text = spawnSync(process.execPath, [
       SCRIPT_PATH,
       '--generated-at',
       '2026-05-16T00:00:00.000Z',
     ], {
       encoding: 'utf8',
-      shell: process.platform === 'win32',
     });
     assert.strictEqual(text.status, 0, text.stderr);
     assert.match(text.stdout, /Supply-chain advisory sources: ready/);
     assert.match(text.stdout, /Linear ITO-57:/);
 
-    const invalid = spawnSync('node', [SCRIPT_PATH, '--unknown'], {
+    const invalid = spawnSync(process.execPath, [SCRIPT_PATH, '--unknown'], {
       encoding: 'utf8',
-      shell: process.platform === 'win32',
     });
     assert.strictEqual(invalid.status, 2);
     assert.match(invalid.stderr, /Unknown argument/);
