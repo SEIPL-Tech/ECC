@@ -55,6 +55,43 @@ function run() {
     assert.match(source, /npm audit --omit=dev --audit-level=high/);
   })) passed++; else failed++;
 
+  if (test('uses an active LTS runtime compatible with dependency engines', () => {
+    assert.match(source, /node-version: '24\.x'/);
+  })) passed++; else failed++;
+
+  if (test('runs each security check independently without hiding failures', () => {
+    const steps = source.split(/\r?\n {6}- name: /).slice(1);
+    for (const command of [
+      'npm audit signatures',
+      'npm audit --omit=dev --audit-level=high',
+      'node tests/ci/scan-supply-chain-iocs.test.js',
+      'node tests/ci/supply-chain-advisory-sources.test.js',
+      'node scripts/ci/scan-supply-chain-iocs.js --json',
+      'node scripts/ci/supply-chain-advisory-sources.js --refresh --json',
+      'node scripts/ci/validate-workflow-security.js',
+    ]) {
+      const step = steps.find(candidate => candidate.includes(command));
+      assert.ok(step, `missing check: ${command}`);
+      assert.match(step, /if: \$\{\{ !cancelled\(\) && steps\.(?:install|setup)\.outcome == 'success' \}\}/,
+        `${command} must still run after another check fails`);
+      assert.doesNotMatch(step, /continue-on-error:|\|\|\s*(?:true|exit\s+0)/);
+    }
+    const signatures = steps.find(step => step.includes('npm audit signatures'));
+    assert.ok(!signatures.includes('npm audit --omit=dev'), 'signature failure must not skip the advisory audit');
+    assert.doesNotMatch(source, /^\s*continue-on-error:/m);
+  })) passed++; else failed++;
+
+  if (test('creates report directories independently and fails when reports are missing', () => {
+    const steps = source.split(/\r?\n {6}- name: /).slice(1);
+    for (const script of ['scan-supply-chain-iocs', 'supply-chain-advisory-sources']) {
+      const step = steps.find(candidate => candidate.includes(`node scripts/ci/${script}.js`));
+      assert.match(step, /mkdir -p artifacts/);
+    }
+    const upload = steps.find(step => step.includes('uses: actions/upload-artifact@'));
+    assert.match(upload, /if: always\(\)/);
+    assert.match(upload, /if-no-files-found: error/);
+  })) passed++; else failed++;
+
   if (test('runs IOC fixtures, emits JSON report, and uploads the artifact', () => {
     assert.match(source, /node tests\/ci\/scan-supply-chain-iocs\.test\.js/);
     assert.match(source, /node scripts\/ci\/scan-supply-chain-iocs\.js --json > artifacts\/supply-chain-ioc-report\.json/);
