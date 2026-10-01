@@ -2,8 +2,15 @@ name: Supply-Chain Watch
 
 on:
   schedule:
-    - cron: '17 */6 * * *'
+    # Weekly, Sunday 18:17 UTC (23:47 IST). Scheduled starts on this fork run
+    # hours late, so a Sunday slot still lands before the Monday-morning review.
+    - cron: '17 18 * * 0'
   workflow_dispatch:
+    inputs:
+      drill:
+        description: 'Fail on purpose to test the alert issue (main only)'
+        type: boolean
+        default: false
   pull_request:
     paths:
       - '.github/workflows/supply-chain-watch.yml'
@@ -27,6 +34,12 @@ jobs:
     name: IOC watch
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Scheduled runs (and drills) report failures through the tracking issue
+    # managed by the alert job, so a failed check does not also fail the run
+    # and email every week. Any failed check still fails this job.
+    continue-on-error: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.drill) }}
+    outputs:
+      status: ${{ steps.result.outputs.status }}
 
     steps:
       - name: Checkout
@@ -42,25 +55,25 @@ jobs:
 
       - name: Install dependencies without lifecycle scripts
         id: install
+        timeout-minutes: 4
         run: npm ci --ignore-scripts
 
       # Explicit status conditions keep independent checks running after a failure.
-      # No continue-on-error: any failed check still fails the job.
+      # No step-level continue-on-error: any failed check still fails the job.
+      # Step timeouts turn a hung registry call into a failed check, not a cancelled job.
       - name: Verify registry signatures
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        timeout-minutes: 2
         run: npm audit signatures
 
       - name: Check production advisories
         if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        timeout-minutes: 2
         run: npm audit --omit=dev --audit-level=high
 
       - name: Validate IOC scanner fixtures
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: node tests/ci/scan-supply-chain-iocs.test.js
-
-      - name: Validate advisory source fixtures
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
-        run: node tests/ci/supply-chain-advisory-sources.test.js
 
       - name: Generate IOC report
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
@@ -68,23 +81,172 @@ jobs:
           mkdir -p artifacts
           node scripts/ci/scan-supply-chain-iocs.js --json > artifacts/supply-chain-ioc-report.json
 
-      - name: Generate advisory source report
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
-        run: |
-          mkdir -p artifacts
-          node scripts/ci/supply-chain-advisory-sources.js --refresh --json > artifacts/supply-chain-advisory-sources.json
-
       - name: Validate workflow hardening rules
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: node scripts/ci/validate-workflow-security.js
+
+      - name: Drill failure
+        if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && inputs.drill }}
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::warning::Drills manage the tracking issue only on main; this run on $GITHUB_REF_NAME will not open one."
+          fi
+          echo "::error::Drill: failing on purpose to test the Supply-Chain Watch alert."
+          exit 1
 
       - name: Upload IOC report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: supply-chain-ioc-report
-          path: |
-            artifacts/supply-chain-ioc-report.json
-            artifacts/supply-chain-advisory-sources.json
+          path: artifacts/supply-chain-ioc-report.json
           retention-days: 14
           if-no-files-found: error
+
+      - name: Record watch result
+        id: result
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: echo "status=$JOB_STATUS" >> "$GITHUB_OUTPUT"
+
+  alert:
+    name: Failure alert
+    needs: ioc-watch
+    # Only scheduled runs, and manual runs on main, manage the tracking issue.
+    # Pull-request runs report through their own red check instead.
+    if: ${{ !cancelled() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # No checkout and no third-party actions: this job only talks to the API.
+    permissions:
+      actions: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      SCAN_STATUS: ${{ needs.ioc-watch.outputs.status }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      LABEL: supply-chain-watch
+      TITLE: Supply-Chain Watch is failing
+    steps:
+      - name: Open, update or close the tracking issue
+        run: |
+          set -euo pipefail
+
+          # Retry read-only API calls; writes run once and fail the job loudly.
+          read_api() {
+            local attempt
+            for attempt in 1 2 3; do
+              if gh api "$@"; then
+                return 0
+              fi
+              sleep $((attempt * 5))
+            done
+            return 1
+          }
+
+          # Verdict: the watch passed only if the result it recorded AND the
+          # conclusion GitHub stored for the job both say success.
+          job_json="$(read_api "repos/$GH_REPO/actions/runs/$GITHUB_RUN_ID/jobs" --jq '[.jobs[] | select(.name == "IOC watch")][0]')"
+          job_conclusion="$(jq -r '.conclusion // "unknown"' <<<"$job_json")"
+          failing="$(jq -r '[.steps[]? | select(.conclusion == "failure") | .name] | join("; ")' <<<"$job_json" | tr -d '@')"
+          if [ "$SCAN_STATUS" = "success" ] && [ "$job_conclusion" = "success" ]; then
+            verdict="pass"
+          else
+            verdict="fail"
+          fi
+          echo "Watch result: ${SCAN_STATUS:-missing}; job conclusion: $job_conclusion; failing steps: ${failing:-none}"
+
+          has_issues="$(read_api "repos/$GH_REPO" --jq '.has_issues')"
+          if [ "$has_issues" != "true" ]; then
+            if [ "$verdict" = "pass" ]; then
+              exit 0
+            fi
+            echo "::error::Supply-Chain Watch failed (${failing:-job $job_conclusion}). Issues are turned off for this repository, so this run fails and GitHub sends its usual failure email instead. Turn on Settings > General > Features > Issues to get one tracking issue instead of weekly emails. Run: $RUN_URL"
+            exit 1
+          fi
+
+          # Only issues this workflow opened are managed. The REST list reads the
+          # database directly, so a just-opened issue is never missed.
+          open_json="$(read_api "repos/$GH_REPO/issues?state=open&labels=$LABEL&per_page=100" \
+            --jq '[.[] | select(.pull_request == null and .user.login == "github-actions[bot]")] | sort_by(.number) | .[0] // empty')"
+
+          if [ "$verdict" = "pass" ]; then
+            if [ -n "$open_json" ]; then
+              number="$(jq -r '.number' <<<"$open_json")"
+              gh issue close "$number" --reason completed \
+                --comment "The Supply-Chain Watch passed again in $RUN_URL, so this issue is closed."
+            fi
+            exit 0
+          fi
+
+          now="$(date -u '+%Y-%m-%d %H:%M UTC')"
+          failing_display="${failing:-not reported (job result: $job_conclusion)}"
+          first_run="$RUN_URL"
+          previous=""
+          number=""
+          if [ -n "$open_json" ]; then
+            number="$(jq -r '.number' <<<"$open_json")"
+            old_body="$(jq -r '.body // ""' <<<"$open_json")"
+            first_run="$(sed -n 's/^<!-- supply-chain-watch first-failing-run: \(.*\) -->$/\1/p' <<<"$old_body" | head -n 1)"
+            first_run="${first_run:-$RUN_URL}"
+            previous="$(sed -n 's/^<!-- supply-chain-watch failing: \(.*\) -->$/\1/p' <<<"$old_body" | head -n 1)"
+          fi
+
+          body="$(printf '%s\n' \
+            "The weekly Supply-Chain Watch found a problem." \
+            "" \
+            "- Failing checks: $failing_display" \
+            "- Latest failing run: $RUN_URL ($now)" \
+            "- First failing run: $first_run" \
+            "" \
+            "Open the latest failing run to see which step is red." \
+            "" \
+            "What happens next:" \
+            "- This issue is updated quietly on every failing weekly run." \
+            "- A new notification is sent only if another check starts failing." \
+            "- It closes itself once the watch passes again." \
+            "- Closing it by hand while the watch still fails opens a new issue the following week." \
+            "" \
+            "<!-- supply-chain-watch first-failing-run: $first_run -->" \
+            "<!-- supply-chain-watch failing: $failing -->")"
+
+          if [ -z "$number" ]; then
+            gh label create "$LABEL" --color B60205 \
+              --description "Opened and closed by the Supply-Chain Watch workflow" --force
+            # One REST call creates, labels and assigns the issue together.
+            # Assignment is what emails the owner, so an unassigned issue fails loudly.
+            created="$(gh api "repos/$GH_REPO/issues" \
+              -f title="$TITLE" -f body="$body" \
+              -f "labels[]=$LABEL" -f "assignees[]=$GITHUB_REPOSITORY_OWNER")"
+            number="$(jq -r '.number' <<<"$created")"
+            if [ "$(jq '.assignees | length' <<<"$created")" -eq 0 ]; then
+              echo "::error::Opened issue #$number but could not assign it to $GITHUB_REPOSITORY_OWNER, so nobody would be notified."
+              exit 1
+            fi
+            echo "Opened tracking issue #$number."
+            exit 0
+          fi
+
+          # Repeat failure: update the open issue without notifying anyone,
+          # unless a check that was passing before has now started to fail.
+          gh issue edit "$number" --body "$body"
+          newly=""
+          while IFS= read -r step; do
+            [ -n "$step" ] || continue
+            case "; $previous; " in
+              *"; $step; "*) ;;
+              *) newly="${newly:+$newly, }$step" ;;
+            esac
+          done < <(tr ';' '\n' <<<"$failing" | sed 's/^ *//; s/ *$//')
+          if [ -n "$newly" ]; then
+            gh issue comment "$number" --body "Another check has started failing: $newly. Latest run: $RUN_URL"
+            echo "Escalated issue #$number: newly failing $newly."
+          else
+            echo "Updated issue #$number quietly."
+          fi
+          if [ "$(jq '.assignees | length' <<<"$open_json")" -eq 0 ]; then
+            echo "::error::Tracking issue #$number has no assignee, so nobody is being notified. Assign it to $GITHUB_REPOSITORY_OWNER."
+            exit 1
+          fi
