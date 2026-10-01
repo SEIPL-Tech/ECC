@@ -343,8 +343,17 @@ function isWrite(call) {
   return call[0] === 'api' && (call.includes('-X') || call.includes('-f'));
 }
 
+// Every temporary directory, removed when the run ends.
+const tempDirs = [];
+
+function makeTempDir(prefix) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  tempDirs.push(dir);
+  return dir;
+}
+
 function createWorld(scriptPath, { hasIssues = true, issues = [], labels = [], config = {} } = {}) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'scw-alert-'));
+  const dir = makeTempDir('scw-alert-');
   const bin = path.join(dir, 'bin');
   fs.mkdirSync(bin);
   fs.writeFileSync(path.join(bin, 'gh'),
@@ -415,7 +424,7 @@ function run() {
     process.exit(0);
   }
 
-  const scriptDir = fs.mkdtempSync(path.join(os.tmpdir(), 'scw-script-'));
+  const scriptDir = makeTempDir('scw-script-');
   const scriptPath = path.join(scriptDir, 'alert.sh');
   fs.writeFileSync(scriptPath, extractAlertScript(fs.readFileSync(WORKFLOW_PATH, 'utf8')));
   const go = (world, week) => scenario(scriptPath, world, week);
@@ -756,6 +765,10 @@ function run() {
     assert.match(result.stdout, /::warning::Could not lock issue #100/);
     assert.deepStrictEqual(result.state.issues[0].assignees, [{ login: OWNER }]);
   });
+
+  for (const dir of tempDirs) {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 
   console.log(`\nPassed: ${passed}`);
   console.log(`Failed: ${failed}`);
