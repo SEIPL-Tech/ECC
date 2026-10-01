@@ -31,24 +31,30 @@ permissions:
 
 jobs:
   ioc-watch:
+    # The alert job finds this job by this name; keep the two in step.
     name: IOC watch
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    # Scheduled runs (and drills) report failures through the tracking issue
-    # managed by the alert job, so a failed check does not also fail the run
-    # and email every week. Any failed check still fails this job.
-    continue-on-error: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.drill) }}
+    # Every step has its own timeout, so a hang fails that step (and the job)
+    # instead of cancelling the job. This job-level limit is only a backstop.
+    timeout-minutes: 30
+    # Scheduled runs (and drills on main) report failures through the tracking
+    # issue managed by the alert job, so a failed check does not also fail the
+    # run and email every week. Any failed check still fails this job.
+    continue-on-error: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.drill && github.ref == 'refs/heads/main') }}
     outputs:
       status: ${{ steps.result.outputs.status }}
+      findings: ${{ steps.findings.outputs.ids }}
 
     steps:
       - name: Checkout
+        timeout-minutes: 2
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
       - name: Setup Node.js
         id: setup
+        timeout-minutes: 3
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: '24.x'
@@ -73,29 +79,52 @@ jobs:
 
       - name: Validate IOC scanner fixtures
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        timeout-minutes: 2
         run: node tests/ci/scan-supply-chain-iocs.test.js
 
       - name: Generate IOC report
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        timeout-minutes: 2
         run: |
           mkdir -p artifacts
           node scripts/ci/scan-supply-chain-iocs.js --json > artifacts/supply-chain-ioc-report.json
 
       - name: Validate workflow hardening rules
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        timeout-minutes: 2
         run: node scripts/ci/validate-workflow-security.js
+
+      # Reporting only, and it never fails the job: a short hash of each high or
+      # critical advisory and each IOC hit, so the alert job can tell when a
+      # check that is already failing finds something new.
+      - name: Fingerprint findings
+        id: findings
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        timeout-minutes: 2
+        run: |
+          set +e
+          {
+            timeout 60 npm audit --omit=dev --json 2>/dev/null \
+              | jq -r '.vulnerabilities[]?.via[]? | objects | select(.severity == "high" or .severity == "critical") | "advisory \(.url)"' 2>/dev/null
+            jq -r '.findings[]? | "ioc \(.filePath) \(.indicator)"' artifacts/supply-chain-ioc-report.json 2>/dev/null
+          } | sort -u | while IFS= read -r line; do
+            printf '%s' "$line" | sha256sum | cut -c1-12
+          done | paste -sd' ' - | sed 's/^/ids=/' >> "$GITHUB_OUTPUT"
+          exit 0
 
       - name: Drill failure
         if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && inputs.drill }}
+        timeout-minutes: 1
         run: |
           if [ "$GITHUB_REF" != "refs/heads/main" ]; then
-            echo "::warning::Drills manage the tracking issue only on main; this run on $GITHUB_REF_NAME will not open one."
+            echo "::warning::Drills manage the tracking issue only on main; this run on $GITHUB_REF_NAME fails red instead."
           fi
           echo "::error::Drill: failing on purpose to test the Supply-Chain Watch alert."
           exit 1
 
       - name: Upload IOC report
         if: always()
+        timeout-minutes: 2
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: supply-chain-ioc-report
@@ -106,6 +135,7 @@ jobs:
       - name: Record watch result
         id: result
         if: always()
+        timeout-minutes: 1
         env:
           JOB_STATUS: ${{ job.status }}
         run: echo "status=$JOB_STATUS" >> "$GITHUB_OUTPUT"
@@ -126,24 +156,48 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
       SCAN_STATUS: ${{ needs.ioc-watch.outputs.status }}
+      FINDINGS: ${{ needs.ioc-watch.outputs.findings }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       LABEL: supply-chain-watch
       TITLE: Supply-Chain Watch is failing
     steps:
       - name: Open, update or close the tracking issue
+        # A step timeout fails the job, so the run fails and the email still
+        # arrives. A job timeout would cancel it, and cancelled runs send no email.
+        timeout-minutes: 4
         run: |
           set -euo pipefail
 
           # Retry read-only API calls; writes run once and fail the job loudly.
+          # On an HTTP error gh prints the error body to stdout, so each attempt
+          # is captured and only a successful one is passed on.
           read_api() {
-            local attempt
+            local attempt out
             for attempt in 1 2 3; do
-              if gh api "$@"; then
+              if out="$(gh api "$@")"; then
+                printf '%s\n' "$out"
                 return 0
               fi
               sleep $((attempt * 5))
             done
             return 1
+          }
+
+          # The issue is locked so that only collaborators can comment in the
+          # owner's alert thread. The bot cannot comment on a locked issue, so it
+          # unlocks around its own comments. Lock calls only warn on failure.
+          lock_issue() {
+            gh api -X PUT "repos/$GH_REPO/issues/$number/lock" --silent \
+              || echo "::warning::Could not lock issue #$number, so anyone can comment on it."
+          }
+          unlock_issue() {
+            gh api -X DELETE "repos/$GH_REPO/issues/$number/lock" --silent \
+              || echo "::warning::Could not unlock issue #$number before commenting."
+          }
+
+          # A hidden marker line from the open issue's body (first match only).
+          marker() {
+            sed -n "s/^<!-- supply-chain-watch $1: \(.*\) -->\$/\1/p" <<<"$old_body" | sed -n 1p
           }
 
           # Verdict: the watch passed only if the result it recorded AND the
@@ -156,6 +210,8 @@ jobs:
           else
             verdict="fail"
           fi
+          # Keep only well-formed finding ids (12 hex characters).
+          findings="$(grep -oE '\b[0-9a-f]{12}\b' <<<"${FINDINGS:-}" | sort -u | paste -sd' ' -)" || findings=""
           echo "Watch result: ${SCAN_STATUS:-missing}; job conclusion: $job_conclusion; failing steps: ${failing:-none}"
 
           has_issues="$(read_api "repos/$GH_REPO" --jq '.has_issues')"
@@ -172,45 +228,103 @@ jobs:
           open_json="$(read_api "repos/$GH_REPO/issues?state=open&labels=$LABEL&per_page=100" \
             --jq '[.[] | select(.pull_request == null and .user.login == "github-actions[bot]")] | sort_by(.number) | .[0] // empty')"
 
+          number=""
+          old_body=""
+          locked="false"
+          if [ -n "$open_json" ]; then
+            number="$(jq -r '.number' <<<"$open_json")"
+            locked="$(jq -r '.locked // false' <<<"$open_json")"
+            # Bodies saved from the web editor come back with CRLF line ends.
+            old_body="$(jq -r '(.body // "") | gsub("\r"; "")' <<<"$open_json")"
+            # A re-run of an older run checks an older commit, so it must not
+            # close or rewrite an issue that a newer run opened or updated.
+            last_fail="$(marker latest-failing-run-id)"
+            if [[ "$last_fail" =~ ^[0-9]+$ ]] && [ "$GITHUB_RUN_ID" -lt "$last_fail" ]; then
+              echo "::notice::Run $GITHUB_RUN_ID is older than failing run $last_fail, so issue #$number is left as it is."
+              exit 0
+            fi
+          fi
+
           if [ "$verdict" = "pass" ]; then
-            if [ -n "$open_json" ]; then
-              number="$(jq -r '.number' <<<"$open_json")"
+            if [ -n "$number" ]; then
+              [ "$locked" != "true" ] || unlock_issue
               gh issue close "$number" --reason completed \
                 --comment "The Supply-Chain Watch passed again in $RUN_URL, so this issue is closed."
+              lock_issue
             fi
             exit 0
           fi
 
           now="$(date -u '+%Y-%m-%d %H:%M UTC')"
           failing_display="${failing:-not reported (job result: $job_conclusion)}"
+          # Link the red job itself: the run page shows Success on purpose.
+          job_url="$(jq -r '.html_url // empty' <<<"$job_json")"
+          case "$job_url" in
+            "$RUN_URL/job/"*) ;;
+            *) job_url="$RUN_URL" ;;
+          esac
           first_run="$RUN_URL"
-          previous=""
-          number=""
-          if [ -n "$open_json" ]; then
-            number="$(jq -r '.number' <<<"$open_json")"
-            old_body="$(jq -r '.body // ""' <<<"$open_json")"
-            first_run="$(sed -n 's/^<!-- supply-chain-watch first-failing-run: \(.*\) -->$/\1/p' <<<"$old_body" | head -n 1)"
-            first_run="${first_run:-$RUN_URL}"
-            previous="$(sed -n 's/^<!-- supply-chain-watch failing: \(.*\) -->$/\1/p' <<<"$old_body" | head -n 1)"
+          seen_checks=""
+          seen_findings=""
+          if [ -n "$number" ]; then
+            # Carry forward only a run link of this repository, never other text.
+            first_run="$(marker first-failing-run)"
+            run_id="${first_run#"${RUN_URL%/*}/"}"
+            if [ "$run_id" = "$first_run" ] || [[ ! "$run_id" =~ ^[0-9]+$ ]]; then
+              first_run="$RUN_URL"
+            fi
+            # Everything this issue has already reported, kept for the whole
+            # episode so a week that hides a failure does not re-announce it.
+            seen_checks="$(marker seen-checks | tr -d '@')"
+            seen_findings="$(marker seen-findings | tr -cd '0-9a-f ')"
           fi
+
+          # Notify only for what this issue has not reported yet: a check that
+          # was not failing before, or a new finding inside any failing check.
+          new_checks=""
+          next_checks="$seen_checks"
+          while IFS= read -r step; do
+            [ -n "$step" ] || continue
+            case "; $next_checks; " in
+              *"; $step; "*) ;;
+              *)
+                new_checks="${new_checks:+$new_checks, }$step"
+                next_checks="${next_checks:+$next_checks; }$step"
+                ;;
+            esac
+          done < <(tr ';' '\n' <<<"$failing" | sed 's/^ *//; s/ *$//')
+          new_findings=0
+          next_findings="$seen_findings"
+          for id in $findings; do
+            case " $next_findings " in
+              *" $id "*) ;;
+              *)
+                new_findings=$((new_findings + 1))
+                next_findings="${next_findings:+$next_findings }$id"
+                ;;
+            esac
+          done
 
           body="$(printf '%s\n' \
             "The weekly Supply-Chain Watch found a problem." \
             "" \
             "- Failing checks: $failing_display" \
-            "- Latest failing run: $RUN_URL ($now)" \
+            "- Latest failing run: $job_url ($now)" \
             "- First failing run: $first_run" \
             "" \
-            "Open the latest failing run to see which step is red." \
+            "The latest-run link opens the red IOC watch job. The run around it shows Success on purpose, so that GitHub does not email every week." \
             "" \
             "What happens next:" \
             "- This issue is updated quietly on every failing weekly run." \
-            "- A new notification is sent only if another check starts failing." \
+            "- github-actions[bot] comments, and you get an email, only if another check starts failing or a failing check finds something new." \
             "- It closes itself once the watch passes again." \
             "- Closing it by hand while the watch still fails opens a new issue the following week." \
+            "- This text is rewritten on every failing run, so put notes in a comment." \
             "" \
             "<!-- supply-chain-watch first-failing-run: $first_run -->" \
-            "<!-- supply-chain-watch failing: $failing -->")"
+            "<!-- supply-chain-watch latest-failing-run-id: $GITHUB_RUN_ID -->" \
+            "<!-- supply-chain-watch seen-checks: $next_checks -->" \
+            "<!-- supply-chain-watch seen-findings: $next_findings -->")"
 
           if [ -z "$number" ]; then
             gh label create "$LABEL" --color B60205 \
@@ -221,6 +335,7 @@ jobs:
               -f title="$TITLE" -f body="$body" \
               -f "labels[]=$LABEL" -f "assignees[]=$GITHUB_REPOSITORY_OWNER")"
             number="$(jq -r '.number' <<<"$created")"
+            lock_issue
             if [ "$(jq '.assignees | length' <<<"$created")" -eq 0 ]; then
               echo "::error::Opened issue #$number but could not assign it to $GITHUB_REPOSITORY_OWNER, so nobody would be notified."
               exit 1
@@ -230,20 +345,20 @@ jobs:
           fi
 
           # Repeat failure: update the open issue without notifying anyone,
-          # unless a check that was passing before has now started to fail.
+          # unless something new turned up since the issue was opened.
           gh issue edit "$number" --body "$body"
-          newly=""
-          while IFS= read -r step; do
-            [ -n "$step" ] || continue
-            case "; $previous; " in
-              *"; $step; "*) ;;
-              *) newly="${newly:+$newly, }$step" ;;
-            esac
-          done < <(tr ';' '\n' <<<"$failing" | sed 's/^ *//; s/ *$//')
-          if [ -n "$newly" ]; then
-            gh issue comment "$number" --body "Another check has started failing: $newly. Latest run: $RUN_URL"
-            echo "Escalated issue #$number: newly failing $newly."
+          if [ -n "$new_checks" ] || [ "$new_findings" -gt 0 ]; then
+            what="${new_checks:+another check has started failing: $new_checks}"
+            if [ "$new_findings" -gt 0 ]; then
+              what="${what:+$what; }$new_findings new finding(s) in: $failing_display"
+            fi
+            # The mention also re-subscribes the owner if they unsubscribed.
+            [ "$locked" != "true" ] || unlock_issue
+            gh issue comment "$number" --body "@$GITHUB_REPOSITORY_OWNER $what. Latest run: $job_url"
+            lock_issue
+            echo "Escalated issue #$number: $what."
           else
+            [ "$locked" = "true" ] || lock_issue
             echo "Updated issue #$number quietly."
           fi
           if [ "$(jq '.assignees | length' <<<"$open_json")" -eq 0 ]; then

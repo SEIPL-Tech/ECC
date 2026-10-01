@@ -20,9 +20,13 @@ const WORKFLOW_PATH = path.join(
 // Anything broader would let other events use the issues: write token.
 const ALERT_IF = "    if: ${{ !cancelled() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')) }}";
 
-// The only continue-on-error allowed: scheduled runs and drills hand their
-// failures to the tracking issue instead of failing the run.
-const WATCH_CONTINUE_ON_ERROR = "    continue-on-error: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.drill) }}";
+// The only continue-on-error allowed: scheduled runs and drills on main hand
+// their failures to the tracking issue instead of failing the run. A drill
+// anywhere else has no alert job behind it, so it must fail red.
+const WATCH_CONTINUE_ON_ERROR = "    continue-on-error: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.drill && github.ref == 'refs/heads/main') }}";
+
+// The alert job reads the watch job's conclusion by this display name.
+const WATCH_JOB_NAME = 'IOC watch';
 
 function test(name, fn) {
   try {
@@ -73,6 +77,8 @@ function run() {
     assert.match(header, /workflow_dispatch:\r?\n\s+inputs:\r?\n\s+drill:/);
     assert.match(header, /drill:[\s\S]*?type: boolean\r?\n\s+default: false/);
     assert.match(header, /pull_request:\r?\n\s+paths:/);
+    // A drill must never cancel a scheduled run that is still in progress.
+    assert.match(header, /^ {2}cancel-in-progress: false$/m);
     assert.match(header, /- '\.github\/workflows\/supply-chain-watch\.yml'/);
     assert.match(header, /- 'package-lock\.json'/);
   })) passed++; else failed++;
@@ -92,7 +98,7 @@ function run() {
     assert.match(alert, /\r?\n {4}permissions:\r?\n {6}actions: read\r?\n {6}issues: write\r?\n {4}env:/);
     assert.strictEqual((source.match(/:\s*write\b/g) || []).length, 1, 'issues: write must be the only write scope');
     assert.match(watch, /uses: actions\/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0/);
-    assert.match(watch, /persist-credentials: false/);
+    assert.match(watch, /^ {10}persist-credentials: false$/m);
     assert.doesNotMatch(source, /id-token:\s*write/);
     assert.doesNotMatch(source, /actions\/cache@/);
   })) passed++; else failed++;
@@ -122,11 +128,25 @@ function run() {
         `${command} must still run after another check fails`);
       assert.doesNotMatch(step, /continue-on-error:|\|\|\s*(?:true|exit\s+0)/);
     }
+    for (const command of [
+      'npm audit signatures',
+      'npm audit --omit=dev --audit-level=high',
+      'node tests/ci/scan-supply-chain-iocs.test.js',
+      'node scripts/ci/scan-supply-chain-iocs.js --json',
+      'node scripts/ci/validate-workflow-security.js',
+    ]) {
+      // Any || (|| true, || :, || echo ...) or set +e could hide a failed check.
+      assert.doesNotMatch(steps.find(candidate => candidate.includes(command)), /\|\||\bset \+e\b/,
+        `${command} must not swallow its own failure`);
+    }
     const signatures = steps.find(step => step.includes('npm audit signatures'));
     assert.ok(!signatures.includes('npm audit --omit=dev'), 'signature failure must not skip the advisory audit');
-    // A hung registry call must fail its step rather than cancel the job.
-    for (const command of ['npm ci --ignore-scripts', 'npm audit signatures', 'npm audit --omit=dev']) {
-      assert.match(steps.find(step => step.includes(command)), /timeout-minutes: \d+/, `${command} needs a step timeout`);
+    // The step ids the checks depend on must exist, or every check is skipped.
+    assert.match(steps.find(step => step.includes('npm ci --ignore-scripts')), /\r?\n {8}id: install\r?\n/);
+    assert.match(steps.find(step => step.includes('uses: actions/setup-node@')), /\r?\n {8}id: setup\r?\n/);
+    // A hang must fail its step rather than cancel the job: cancelled runs send no email.
+    for (const step of steps) {
+      assert.match(step, /\r?\n {8}timeout-minutes: \d+\r?\n/, `step "${step.split(/\r?\n/)[0]}" needs a step timeout`);
     }
     // No step may swallow a failure; the single allowed switch is job-level.
     assert.ok(lines(watch).includes(WATCH_CONTINUE_ON_ERROR), 'job-level continue-on-error must match the allowed expression');
@@ -152,6 +172,18 @@ function run() {
     assert.doesNotMatch(source, /supply-chain-advisory-sources/, 'advisory-source refresh is upstream-only bookkeeping');
   })) passed++; else failed++;
 
+  if (test('fingerprints findings for the alert without ever failing the job', () => {
+    assert.match(watch, /outputs:\r?\n(?:\s+[a-z]+: .*\r?\n)*?\s+findings: \$\{\{ steps\.findings\.outputs\.ids \}\}/);
+    const step = stepsOf(watch).find(candidate => candidate.startsWith('Fingerprint findings'));
+    assert.ok(step, 'missing fingerprint step');
+    assert.match(step, /\r?\n {8}id: findings\r?\n/);
+    assert.match(step, /run: \|\r?\n {10}set \+e\r?\n/);
+    assert.match(step, /\r?\n {10}exit 0\s*$/, 'the fingerprint step must end with exit 0');
+    assert.match(step, /timeout 60 npm audit --omit=dev --json/);
+    assert.match(step, /"ioc \\\(\.filePath\) \\\(\.indicator\)"/, 'IOC fingerprints leave out line numbers');
+    assert.match(step, /sed 's\/\^\/ids=\/' >> "\$GITHUB_OUTPUT"/);
+  })) passed++; else failed++;
+
   if (test('drill fails a real step and only on manual dispatch', () => {
     const drill = stepsOf(watch).find(step => step.startsWith('Drill failure'));
     assert.ok(drill, 'missing drill step');
@@ -172,6 +204,12 @@ function run() {
     assert.ok(alert, 'missing alert job');
     assert.match(alert, /needs: ioc-watch/);
     assert.ok(lines(alert).includes(ALERT_IF), 'alert if condition must match exactly');
+    // A step-level if (for example failure()) would skip the alert: under
+    // continue-on-error the watch job reports success to its dependents.
+    assert.strictEqual(lines(alert).filter(line => /^\s+if:/.test(line)).length, 1, 'no step-level if may skip the alert');
+    // A step timeout fails the job; the job timeout would only cancel it.
+    assert.match(alert, /\r?\n {4}timeout-minutes: 5\r?\n/);
+    assert.match(alert, /- name: Open, update or close the tracking issue\r?\n(?:\s+#[^\n]*\r?\n)*\s+timeout-minutes: 4\r?\n/);
     assert.doesNotMatch(alert, /^\s+uses:/m, 'alert job must not run checkout or third-party actions');
     assert.doesNotMatch(alert, /\bnpm\b|\bnode\b/, 'alert job must not run repository code');
     const script = alert.slice(alert.indexOf('run: |'));
@@ -183,20 +221,53 @@ function run() {
     assert.match(alert, /SCAN_STATUS: \$\{\{ needs\.ioc-watch\.outputs\.status \}\}/);
     assert.doesNotMatch(source, /needs\.ioc-watch\.result/, 'needs.result reads success under continue-on-error');
     assert.match(alert, /actions\/runs\/\$GITHUB_RUN_ID\/jobs/);
+    // The verdict finds the watch job by name; a rename would fail every week.
+    assert.ok(lines(watch).includes(`    name: ${WATCH_JOB_NAME}`), 'watch job display name changed');
+    assert.ok(alert.includes(`select(.name == "${WATCH_JOB_NAME}")`), 'alert must select the watch job by its name');
+    // gh prints the error body to stdout on HTTP errors; a retry must not pass it on.
+    assert.match(alert, /if out="\$\(gh api "\$@"\)"; then\s+printf '%s\\n' "\$out"/);
     assert.match(alert, /if \[ "\$SCAN_STATUS" = "success" \] && \[ "\$job_conclusion" = "success" \]; then\s+verdict="pass"\s+else\s+verdict="fail"/);
   })) passed++; else failed++;
 
   if (test('alert keeps one assigned tracking issue and stays quiet on repeats', () => {
     assert.match(alert, /\.has_issues/);
-    assert.match(alert, /Issues are turned off[\s\S]*?exit 1/, 'with Issues off a failure must fail the run so email still arrives');
+    assert.match(alert, /Issues are turned off[^\n]*\r?\n\s+exit 1\r?\n/, 'with Issues off a failure must fail the run so email still arrives');
     assert.match(alert, /issues\?state=open&labels=\$LABEL/, 'look up the open issue through the REST list');
     assert.match(alert, /\.user\.login == "github-actions\[bot\]"/, 'only manage issues this workflow opened');
-    assert.match(alert, /-f "assignees\[\]=\$GITHUB_REPOSITORY_OWNER"/, 'the owner must be assigned or nobody is notified');
-    assert.match(alert, /\.assignees \| length[\s\S]*?exit 1/, 'an unassigned issue must fail loudly');
+    assert.match(alert, /-f "labels\[\]=\$LABEL" -f "assignees\[\]=\$GITHUB_REPOSITORY_OWNER"/,
+      'the issue must carry the label the lookup filters on, and the owner must be assigned');
+    const guards = alert.match(/\.assignees \| length' <<<"\$(?:created|open_json)"\)" -eq 0 \]; then\r?\n\s+echo "::error::[^\n]*\r?\n\s+exit 1\r?\n/g) || [];
+    assert.strictEqual(guards.length, 2, 'both the new and the open issue must fail loudly when unassigned');
     assert.match(alert, /gh issue edit "\$number" --body "\$body"/, 'repeat failures update the issue quietly');
     assert.strictEqual((alert.match(/gh issue comment /g) || []).length, 1);
-    assert.match(alert, /if \[ -n "\$newly" \]; then\s+gh issue comment /, 'comment only when another check starts failing');
+    assert.doesNotMatch(alert, /\/comments\b/, 'no other way to post comments');
+    assert.match(alert, /if \[ -n "\$new_checks" \] \|\| \[ "\$new_findings" -gt 0 \]; then/,
+      'comment only when a check starts failing or a failing check finds something new');
+    assert.match(alert, /gh issue comment "\$number" --body "@\$GITHUB_REPOSITORY_OWNER /,
+      'the escalation mentions the owner, which re-subscribes them');
     assert.match(alert, /gh issue close "\$number"/, 'a passing run closes the issue');
+  })) passed++; else failed++;
+
+  if (test('alert remembers what it reported and ignores edited or stale state', () => {
+    for (const name of ['first-failing-run', 'latest-failing-run-id', 'seen-checks', 'seen-findings']) {
+      assert.ok(alert.includes(`"<!-- supply-chain-watch ${name}: $`), `body must write the ${name} marker`);
+    }
+    assert.match(alert, /seen_checks="\$\(marker seen-checks \| tr -d '@'\)"/);
+    assert.match(alert, /seen_findings="\$\(marker seen-findings \| tr -cd '0-9a-f '\)"/);
+    assert.match(alert, /gsub\("\\r"; ""\)/, 'CRLF bodies from the web editor must still parse');
+    assert.match(alert, /\[ "\$GITHUB_RUN_ID" -lt "\$last_fail" \]/, 'an older re-run must not close or rewrite a newer failure');
+    assert.match(alert, /if \[ "\$run_id" = "\$first_run" \] \|\| \[\[ ! "\$run_id" =~ \^\[0-9\]\+\$ \]\]; then\s+first_run="\$RUN_URL"/,
+      'only a run link of this repository is carried forward');
+    assert.match(alert, /grep -oE '\\b\[0-9a-f\]\{12\}\\b' <<<"\$\{FINDINGS:-\}"/, 'finding ids are sanitised');
+    assert.match(alert, /FINDINGS: \$\{\{ needs\.ioc-watch\.outputs\.findings \}\}/);
+  })) passed++; else failed++;
+
+  if (test('alert locks the issue and unlocks only around its own comments', () => {
+    assert.match(alert, /gh api -X PUT "repos\/\$GH_REPO\/issues\/\$number\/lock" --silent/);
+    assert.match(alert, /gh api -X DELETE "repos\/\$GH_REPO\/issues\/\$number\/lock" --silent/);
+    assert.match(alert, /number="\$\(jq -r '\.number' <<<"\$created"\)"\r?\n\s+lock_issue\r?\n/, 'a new issue is locked at once');
+    assert.match(alert, /\[ "\$locked" != "true" \] \|\| unlock_issue\r?\n\s+gh issue close /);
+    assert.match(alert, /\[ "\$locked" != "true" \] \|\| unlock_issue\r?\n\s+gh issue comment [^\n]*\r?\n\s+lock_issue\r?\n/);
   })) passed++; else failed++;
 
   console.log(`\nPassed: ${passed}`);
